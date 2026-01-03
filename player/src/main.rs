@@ -29,6 +29,7 @@ struct AppState {
     movies: Vec<MovieEntry>,
     selected: usize,
     movie_info_cache: HashMap<PathBuf, MovieInfo>,
+    scroll_offset: usize,
 }
 
 fn is_video(path: &Path) -> bool {
@@ -291,6 +292,7 @@ fn app(terminal: &mut DefaultTerminal, movies: &[MovieEntry], selected_index: &R
         movies: movies.to_vec(),
         selected: 0,
         movie_info_cache: HashMap::new(),
+        scroll_offset: 0,
     };
 
     let mut last_input_time = Instant::now();
@@ -410,6 +412,7 @@ fn render(frame: &mut Frame, state: &mut AppState, elapsed: Duration, timeout_se
     // Build display list with group headers
     let mut items: Vec<ListItem> = Vec::new();
     let mut current_group: Option<&str> = None;
+    let mut selected_display_index = 0; // Track where selected item appears in display list
     
     for (movie_idx, movie) in state.movies.iter().enumerate() {
         // Add group header if this is a new group
@@ -440,6 +443,11 @@ fn render(frame: &mut Frame, state: &mut AppState, elapsed: Duration, timeout_se
         };
         
         items.push(ListItem::new(item_text).style(style));
+        
+        // Track display index for selected movie (after adding to list)
+        if movie_idx == state.selected {
+            selected_display_index = items.len() - 1;
+        }
     }
     
     // Add separator and "Random Movie" option with its own group
@@ -449,6 +457,10 @@ fn render(frame: &mut Frame, state: &mut AppState, elapsed: Duration, timeout_se
             .add_modifier(Modifier::BOLD)));
     
     let random_movie_idx = state.movies.len();
+    if state.selected == random_movie_idx {
+        selected_display_index = items.len();
+    }
+    
     let random_prefix = if state.selected == random_movie_idx { "> " } else { "  " };
     let random_style = if state.selected == random_movie_idx {
         Style::default()
@@ -460,7 +472,31 @@ fn render(frame: &mut Frame, state: &mut AppState, elapsed: Duration, timeout_se
     };
     items.push(ListItem::new(format!("{}Random Movie", random_prefix)).style(random_style));
 
-    let list = List::new(items)
+    // Calculate visible area (accounting for borders - 2 lines for top/bottom borders)
+    let visible_height = list_area.height.saturating_sub(2);
+    
+    // Update scroll offset to keep selected item visible
+    if selected_display_index < state.scroll_offset {
+        // Selected item is above visible area, scroll up
+        state.scroll_offset = selected_display_index;
+    } else if selected_display_index >= state.scroll_offset + visible_height as usize {
+        // Selected item is below visible area, scroll down
+        state.scroll_offset = selected_display_index.saturating_sub(visible_height as usize - 1);
+    }
+    
+    // Ensure scroll offset doesn't go beyond bounds
+    if state.scroll_offset + visible_height as usize > items.len() {
+        state.scroll_offset = items.len().saturating_sub(visible_height as usize);
+    }
+    if state.scroll_offset > items.len() {
+        state.scroll_offset = 0;
+    }
+    
+    // Get visible slice of items
+    let end_index = (state.scroll_offset + visible_height as usize).min(items.len());
+    let visible_items: Vec<ListItem> = items[state.scroll_offset..end_index].to_vec();
+
+    let list = List::new(visible_items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
