@@ -22,3 +22,5 @@ target
 
 # Movies
 movies/
+
+.DS_Store
