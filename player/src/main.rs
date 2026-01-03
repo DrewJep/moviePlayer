@@ -17,8 +17,14 @@ struct MovieInfo {
     resolution: Option<String>,
 }
 
+#[derive(Clone)]
+struct MovieEntry {
+    path: PathBuf,
+    group_name: String,
+}
+
 struct AppState {
-    movies: Vec<PathBuf>,
+    movies: Vec<MovieEntry>,
     selected: usize,
     movie_info_cache: HashMap<PathBuf, MovieInfo>,
 }
@@ -30,17 +36,76 @@ fn is_video(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn load_movies() -> std::io::Result<Vec<PathBuf>> {
+fn load_movies() -> std::io::Result<Vec<MovieEntry>> {
     let movies_dir = Path::new("movies");
 
-    let mut movies: Vec<_> = fs::read_dir(movies_dir)?
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.is_file() && is_video(p))
-        .collect();
-
-    movies.sort();
-    Ok(movies)
+    // Recursively collect all video files
+    let mut movies: Vec<MovieEntry> = Vec::new();
+    
+    fn collect_movies(dir: &Path, base_dir: &Path, movies: &mut Vec<MovieEntry>) -> std::io::Result<()> {
+        if dir.is_dir() {
+            for entry in fs::read_dir(dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                
+                if path.is_file() && is_video(&path) {
+                    // Get the parent directory name relative to the base movies directory
+                    let group_name = if let Some(parent) = path.parent() {
+                        if parent == base_dir {
+                            "Root".to_string()
+                        } else {
+                            parent.file_name()
+                                .and_then(|n| n.to_str())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| "Root".to_string())
+                        }
+                    } else {
+                        "Root".to_string()
+                    };
+                    
+                    movies.push(MovieEntry {
+                        path,
+                        group_name,
+                    });
+                } else if path.is_dir() {
+                    // Recursively search subdirectories
+                    collect_movies(&path, base_dir, movies)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    
+    collect_movies(movies_dir, movies_dir, &mut movies)?;
+    
+    // Group movies by group_name, then sort within groups
+    let mut groups: HashMap<String, Vec<MovieEntry>> = HashMap::new();
+    for movie in movies {
+        groups.entry(movie.group_name.clone())
+            .or_insert_with(Vec::new)
+            .push(movie);
+    }
+    
+    // Sort groups (but put "Root" first), then sort movies within each group
+    let mut group_names: Vec<String> = groups.keys().cloned().collect();
+    group_names.sort();
+    if let Some(root_idx) = group_names.iter().position(|n| n == "Root") {
+        group_names.remove(root_idx);
+        group_names.insert(0, "Root".to_string());
+    }
+    
+    let mut result: Vec<MovieEntry> = Vec::new();
+    for group_name in group_names {
+        let mut group_movies = groups.remove(&group_name).unwrap();
+        group_movies.sort_by(|a, b| {
+            a.path.file_name()
+                .and_then(|n| n.to_str())
+                .cmp(&b.path.file_name().and_then(|n| n.to_str()))
+        });
+        result.extend(group_movies);
+    }
+    
+    Ok(result)
 }
 
 fn format_duration(seconds: f64) -> String {
@@ -157,7 +222,7 @@ fn get_movie_info(path: &Path) -> MovieInfo {
     }
 }
 
-fn play_movies_from_index(movies: &[PathBuf], start_index: usize) -> std::io::Result<()> {
+fn play_movies_from_index(movies: &[MovieEntry], start_index: usize) -> std::io::Result<()> {
     if movies.is_empty() {
         return Ok(());
     }
@@ -167,13 +232,13 @@ fn play_movies_from_index(movies: &[PathBuf], start_index: usize) -> std::io::Re
     
     loop {
         let movie = &movies[current_index];
-        println!("Playing {}", movie.display());
+        println!("Playing {}", movie.path.display());
 
         let status = Command::new("mpv")
             .args([
                 "--fullscreen",
                 "--no-terminal",
-                movie.to_str().unwrap(),
+                movie.path.to_str().unwrap(),
             ])
             .status()
             .expect("failed to start mpv");
@@ -208,7 +273,7 @@ fn main() -> color_eyre::Result<()> {
     Ok(())
 }
 
-fn app(terminal: &mut DefaultTerminal, movies: &[PathBuf], selected_index: &RefCell<Option<usize>>) -> std::io::Result<()> {
+fn app(terminal: &mut DefaultTerminal, movies: &[MovieEntry], selected_index: &RefCell<Option<usize>>) -> std::io::Result<()> {
     let mut state = AppState {
         movies: movies.to_vec(),
         selected: 0,
@@ -270,34 +335,50 @@ fn render(frame: &mut Frame, state: &mut AppState) {
     let list_area = chunks[0];
     let info_area = chunks[1];
     
-    // Render the movie list
-    let mut items: Vec<ListItem> = state.movies
-        .iter()
-        .enumerate()
-        .map(|(i, movie)| {
-            let name = movie.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("Unknown");
-            let prefix = if i == state.selected { "> " } else { "  " };
-            let item_text = format!("{}{}", prefix, name);
-            
-            // Style selected items with bright cyan, unselected with gray
-            let style = if i == state.selected {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-                    .fg(Color::Gray)
-            };
-            
-            ListItem::new(item_text).style(style)
-        })
-        .collect();
+    // Build display list with group headers
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut current_group: Option<&str> = None;
     
-    // Add "Random Movie" option
-    let random_prefix = if state.selected == state.movies.len() { "> " } else { "  " };
-    let random_style = if state.selected == state.movies.len() {
+    for (movie_idx, movie) in state.movies.iter().enumerate() {
+        // Add group header if this is a new group
+        if current_group != Some(movie.group_name.as_str()) {
+            current_group = Some(movie.group_name.as_str());
+            let header_text = format!("┌─ {} ─┐", movie.group_name);
+            items.push(ListItem::new(header_text)
+                .style(Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)));
+        }
+        
+        // Add movie item
+        let name = movie.path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("Unknown");
+        let prefix = if movie_idx == state.selected { "> " } else { "  " };
+        let item_text = format!("{}{}", prefix, name);
+        
+        // Style selected items with bright cyan, unselected with gray
+        let style = if movie_idx == state.selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(Color::Gray)
+        };
+        
+        items.push(ListItem::new(item_text).style(style));
+    }
+    
+    // Add separator and "Random Movie" option with its own group
+    items.push(ListItem::new("┌─ Special ─┐")
+        .style(Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)));
+    
+    let random_movie_idx = state.movies.len();
+    let random_prefix = if state.selected == random_movie_idx { "> " } else { "  " };
+    let random_style = if state.selected == random_movie_idx {
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
@@ -323,10 +404,10 @@ fn render(frame: &mut Frame, state: &mut AppState) {
         let movie = &state.movies[state.selected];
         
         // Get or cache movie info
-        let movie_info = state.movie_info_cache.entry(movie.clone())
-            .or_insert_with(|| get_movie_info(movie));
+        let movie_info = state.movie_info_cache.entry(movie.path.clone())
+            .or_insert_with(|| get_movie_info(&movie.path));
         
-        let movie_name = movie.file_name()
+        let movie_name = movie.path.file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("Unknown");
         
