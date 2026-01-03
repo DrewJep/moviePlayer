@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use ratatui::{DefaultTerminal, Frame};
 
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "avi", "mov", "webm", "m4v"];
 
@@ -11,7 +12,7 @@ fn is_video(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn main() -> std::io::Result<()> {
+fn play_movies() -> std::io::Result<()> {
     let movies_dir = Path::new("movies");
 
     let mut movies: Vec<_> = fs::read_dir(movies_dir)?
@@ -47,4 +48,24 @@ fn main() -> std::io::Result<()> {
             }
         }
     }
+}
+
+fn main() -> color_eyre::Result<()> {
+    color_eyre::install()?;
+    ratatui::run(app)?;
+    Ok(())
+}
+
+fn app(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
+    loop {
+        terminal.draw(render)?;
+        if crossterm::event::read()?.is_key_press() {
+            // break Ok(());
+            play_movies();
+        }
+    }
+}
+
+fn render(frame: &mut Frame) {
+    frame.render_widget("hello world", frame.area());
 }
