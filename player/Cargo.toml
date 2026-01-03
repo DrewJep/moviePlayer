@@ -8,6 +8,7 @@ color-eyre = "0.6.3"
 crossterm = "0.29.0"
 ratatui = "0.30.0"
 rand = "0.8"
+serde_json = "1.0"
 
 [profile.release]
 codegen-units = 1

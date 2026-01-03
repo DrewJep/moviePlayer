@@ -2,15 +2,25 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::cell::RefCell;
-use ratatui::{DefaultTerminal, Frame, widgets::{Block, Borders, List, ListItem}};
+use std::collections::HashMap;
+use ratatui::{DefaultTerminal, Frame, widgets::{Block, Borders, List, ListItem, Paragraph}, layout::{Layout, Constraint}, style::{Style, Color, Modifier}, text::{Line, Span}};
 use crossterm::event::{Event, KeyCode, KeyEventKind};
 use rand::Rng;
 
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "avi", "mov", "webm", "m4v"];
 
+#[derive(Clone, Debug)]
+struct MovieInfo {
+    runtime: Option<String>,
+    file_size: Option<String>,
+    codec: Option<String>,
+    resolution: Option<String>,
+}
+
 struct AppState {
     movies: Vec<PathBuf>,
     selected: usize,
+    movie_info_cache: HashMap<PathBuf, MovieInfo>,
 }
 
 fn is_video(path: &Path) -> bool {
@@ -31,6 +41,120 @@ fn load_movies() -> std::io::Result<Vec<PathBuf>> {
 
     movies.sort();
     Ok(movies)
+}
+
+fn format_duration(seconds: f64) -> String {
+    let hours = (seconds / 3600.0) as u64;
+    let minutes = ((seconds % 3600.0) / 60.0) as u64;
+    let secs = (seconds % 60.0) as u64;
+    
+    if hours > 0 {
+        format!("{}:{:02}:{:02}", hours, minutes, secs)
+    } else {
+        format!("{}:{:02}", minutes, secs)
+    }
+}
+
+fn format_file_size(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit_idx = 0;
+    
+    while size >= 1024.0 && unit_idx < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit_idx += 1;
+    }
+    
+    if unit_idx == 0 {
+        format!("{} {}", bytes, UNITS[unit_idx])
+    } else {
+        format!("{:.2} {}", size, UNITS[unit_idx])
+    }
+}
+
+fn get_movie_info(path: &Path) -> MovieInfo {
+    // Try to get metadata using ffprobe
+    let output = Command::new("ffprobe")
+        .args([
+            "-v", "error",
+            "-show_entries", "format=duration,size:stream=codec_name,width,height",
+            "-of", "json",
+            path.to_str().unwrap_or(""),
+        ])
+        .output();
+    
+    match output {
+        Ok(output) if output.status.success() => {
+            let json_str = String::from_utf8_lossy(&output.stdout);
+            let mut runtime = None;
+            let mut file_size = None;
+            let mut codec = None;
+            let mut resolution = None;
+            
+            // Parse JSON to extract information
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                // Get duration from format
+                if let Some(format) = json.get("format") {
+                    if let Some(duration_str) = format.get("duration")
+                        .and_then(|d| d.as_str()) {
+                        if let Ok(duration_secs) = duration_str.parse::<f64>() {
+                            runtime = Some(format_duration(duration_secs));
+                        }
+                    }
+                    if let Some(size_str) = format.get("size")
+                        .and_then(|s| s.as_str()) {
+                        if let Ok(size_bytes) = size_str.parse::<u64>() {
+                            file_size = Some(format_file_size(size_bytes));
+                        }
+                    }
+                }
+                
+                // Get codec and resolution from streams (usually first video stream)
+                if let Some(streams) = json.get("streams")
+                    .and_then(|s| s.as_array()) {
+                    for stream in streams {
+                        if stream.get("codec_type").and_then(|t| t.as_str()) == Some("video") {
+                            if codec.is_none() {
+                                if let Some(codec_name) = stream.get("codec_name")
+                                    .and_then(|c| c.as_str()) {
+                                    codec = Some(codec_name.to_string());
+                                }
+                            }
+                            if resolution.is_none() {
+                                if let (Some(w), Some(h)) = (
+                                    stream.get("width").and_then(|w| w.as_u64()),
+                                    stream.get("height").and_then(|h| h.as_u64()),
+                                ) {
+                                    resolution = Some(format!("{}x{}", w, h));
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            MovieInfo {
+                runtime,
+                file_size,
+                codec,
+                resolution,
+            }
+        }
+        _ => {
+            // Fallback: try to get file size at least
+            let file_size = fs::metadata(path)
+                .ok()
+                .map(|m| format_file_size(m.len()));
+            
+            MovieInfo {
+                runtime: None,
+                file_size,
+                codec: None,
+                resolution: None,
+            }
+        }
+    }
 }
 
 fn play_movies_from_index(movies: &[PathBuf], start_index: usize) -> std::io::Result<()> {
@@ -88,10 +212,11 @@ fn app(terminal: &mut DefaultTerminal, movies: &[PathBuf], selected_index: &RefC
     let mut state = AppState {
         movies: movies.to_vec(),
         selected: 0,
+        movie_info_cache: HashMap::new(),
     };
 
     loop {
-        terminal.draw(|frame| render(frame, &state))?;
+        terminal.draw(|frame| render(frame, &mut state))?;
         
         if let Event::Key(key) = crossterm::event::read()? {
             if key.kind != KeyEventKind::Press {
@@ -135,7 +260,17 @@ fn app(terminal: &mut DefaultTerminal, movies: &[PathBuf], selected_index: &RefC
     }
 }
 
-fn render(frame: &mut Frame, state: &AppState) {
+fn render(frame: &mut Frame, state: &mut AppState) {
+    // Split the frame into two areas: left for list, right for info
+    let chunks = Layout::default()
+        .direction(ratatui::layout::Direction::Horizontal)
+        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)].as_ref())
+        .split(frame.area());
+    
+    let list_area = chunks[0];
+    let info_area = chunks[1];
+    
+    // Render the movie list
     let mut items: Vec<ListItem> = state.movies
         .iter()
         .enumerate()
@@ -144,16 +279,113 @@ fn render(frame: &mut Frame, state: &AppState) {
                 .and_then(|n| n.to_str())
                 .unwrap_or("Unknown");
             let prefix = if i == state.selected { "> " } else { "  " };
-            ListItem::new(format!("{}{}", prefix, name))
+            let item_text = format!("{}{}", prefix, name);
+            
+            // Style selected items with bright cyan, unselected with gray
+            let style = if i == state.selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(Color::Gray)
+            };
+            
+            ListItem::new(item_text).style(style)
         })
         .collect();
     
     // Add "Random Movie" option
     let random_prefix = if state.selected == state.movies.len() { "> " } else { "  " };
-    items.push(ListItem::new(format!("{}Random Movie", random_prefix)));
+    let random_style = if state.selected == state.movies.len() {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Gray)
+    };
+    items.push(ListItem::new(format!("{}Random Movie", random_prefix)).style(random_style));
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Select a Movie"));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Blue))
+                .title_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                .title("Select a Movie")
+        );
 
-    frame.render_widget(list, frame.area());
+    frame.render_widget(list, list_area);
+    
+    // Render the info panel
+    let info_lines: Vec<Line> = if state.selected < state.movies.len() {
+        let movie = &state.movies[state.selected];
+        
+        // Get or cache movie info
+        let movie_info = state.movie_info_cache.entry(movie.clone())
+            .or_insert_with(|| get_movie_info(movie));
+        
+        let movie_name = movie.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("Unknown");
+        
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled("File: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(movie_name, Style::default().fg(Color::White)),
+            ]),
+            Line::from(""),
+        ];
+        
+        if let Some(ref runtime) = movie_info.runtime {
+            lines.push(Line::from(vec![
+                Span::styled("Runtime: ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::styled(runtime, Style::default().fg(Color::White)),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("Runtime: ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::styled("Unknown", Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+        
+        if let Some(ref file_size) = movie_info.file_size {
+            lines.push(Line::from(vec![
+                Span::styled("File Size: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(file_size, Style::default().fg(Color::White)),
+            ]));
+        }
+        
+        if let Some(ref codec) = movie_info.codec {
+            lines.push(Line::from(vec![
+                Span::styled("Codec: ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                Span::styled(codec, Style::default().fg(Color::White)),
+            ]));
+        }
+        
+        if let Some(ref resolution) = movie_info.resolution {
+            lines.push(Line::from(vec![
+                Span::styled("Resolution: ", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                Span::styled(resolution, Style::default().fg(Color::White)),
+            ]));
+        }
+        
+        lines
+    } else {
+        vec![Line::from(vec![
+            Span::styled("Select a movie to see details", Style::default().fg(Color::DarkGray)),
+        ])]
+    };
+    
+    let info_paragraph = Paragraph::new(info_lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Magenta))
+                .title_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                .title("Movie Info")
+        );
+    
+    frame.render_widget(info_paragraph, info_area);
 }
