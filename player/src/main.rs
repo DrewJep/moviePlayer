@@ -3,9 +3,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::time::{Instant, Duration};
 use ratatui::{DefaultTerminal, Frame, widgets::{Block, Borders, List, ListItem, Paragraph}, layout::{Layout, Constraint}, style::{Style, Color, Modifier}, text::{Line, Span}};
-use crossterm::event::{Event, KeyCode, KeyEventKind};
+use crossterm::event::{Event, KeyCode, KeyEventKind, poll};
 use rand::Rng;
+use rand::seq::SliceRandom;
 
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "avi", "mov", "webm", "m4v"];
 
@@ -222,16 +224,26 @@ fn get_movie_info(path: &Path) -> MovieInfo {
     }
 }
 
-fn play_movies_from_index(movies: &[MovieEntry], start_index: usize) -> std::io::Result<()> {
+fn play_movies_from_index(movies: &[MovieEntry], start_index: usize, shuffle_order: bool) -> std::io::Result<()> {
     if movies.is_empty() {
         return Ok(());
     }
 
-    // Play movies starting from start_index, then wrap around
-    let mut current_index = start_index;
-    
-    loop {
-        let movie = &movies[current_index];
+    // If shuffle_order is true, create a shuffled copy of the movies
+    let movies_to_play: Vec<MovieEntry> = if shuffle_order {
+        let mut shuffled: Vec<MovieEntry> = movies.to_vec();
+        let mut rng = rand::thread_rng();
+        shuffled.shuffle(&mut rng);
+        shuffled
+    } else {
+        // For normal playback, keep original order but rotate to start_index
+        let mut rotated = movies[start_index..].to_vec();
+        rotated.extend_from_slice(&movies[..start_index]);
+        rotated
+    };
+
+    // Play movies in order (either shuffled or rotated)
+    for movie in movies_to_play {
         println!("Playing {}", movie.path.display());
 
         let status = Command::new("mpv")
@@ -248,9 +260,9 @@ fn play_movies_from_index(movies: &[MovieEntry], start_index: usize) -> std::io:
         if exit_code != 0 {
             return Ok(());
         }
-        
-        current_index = (current_index + 1) % movies.len();
     }
+    
+    Ok(())
 }
 
 fn main() -> color_eyre::Result<()> {
@@ -263,30 +275,57 @@ fn main() -> color_eyre::Result<()> {
     }
     
     let selected_index = RefCell::new(None);
-    ratatui::run(|terminal| app(terminal, &movies, &selected_index))?;
+    let shuffle_queue = RefCell::new(false);
+    ratatui::run(|terminal| app(terminal, &movies, &selected_index, &shuffle_queue))?;
     
     // After terminal is restored, play the selected movie
     if let Some(start_index) = selected_index.into_inner() {
-        play_movies_from_index(&movies, start_index)?;
+        play_movies_from_index(&movies, start_index, shuffle_queue.into_inner())?;
     }
     
     Ok(())
 }
 
-fn app(terminal: &mut DefaultTerminal, movies: &[MovieEntry], selected_index: &RefCell<Option<usize>>) -> std::io::Result<()> {
+fn app(terminal: &mut DefaultTerminal, movies: &[MovieEntry], selected_index: &RefCell<Option<usize>>, shuffle_queue: &RefCell<bool>) -> std::io::Result<()> {
     let mut state = AppState {
         movies: movies.to_vec(),
         selected: 0,
         movie_info_cache: HashMap::new(),
     };
 
+    let mut last_input_time = Instant::now();
+    const TIMEOUT_SECONDS: u64 = 30;
+
     loop {
-        terminal.draw(|frame| render(frame, &mut state))?;
+        let elapsed = last_input_time.elapsed();
+        terminal.draw(|frame| render(frame, &mut state, elapsed, TIMEOUT_SECONDS))?;
         
+        // Check if 30 seconds have passed since last input
+        if elapsed >= Duration::from_secs(TIMEOUT_SECONDS) {
+            // Auto-select random movie and shuffle queue
+            let random_index = rand::thread_rng().gen_range(0..state.movies.len());
+            *selected_index.borrow_mut() = Some(random_index);
+            *shuffle_queue.borrow_mut() = true;
+            return Ok(());
+        }
+        
+        // Poll for events with a short timeout (100ms) to allow checking elapsed time
+        let remaining_time = Duration::from_secs(TIMEOUT_SECONDS) - elapsed;
+        let poll_timeout = remaining_time.min(Duration::from_millis(100));
+        
+        if poll(poll_timeout)? {
         if let Event::Key(key) = crossterm::event::read()? {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+
+                // Handle Esc immediately (exit without resetting timer)
+                if key.code == KeyCode::Esc {
+                    return Ok(());
+                }
+                
+                // Reset the timer on any other user input
+                last_input_time = Instant::now();
 
             match key.code {
                 KeyCode::Up => {
@@ -303,37 +342,70 @@ fn app(terminal: &mut DefaultTerminal, movies: &[MovieEntry], selected_index: &R
                         state.selected = 0; // Wrap to first movie
                     }
                 }
-                KeyCode::Enter => {
-                    // Store the selected index and exit to restore terminal
-                    let start_index = if state.selected == state.movies.len() {
-                        // Random movie selected
-                        rand::thread_rng().gen_range(0..state.movies.len())
-                    } else {
-                        // Selected movie
-                        state.selected
-                    };
-                    
-                    *selected_index.borrow_mut() = Some(start_index);
-                    return Ok(());
+                    KeyCode::Enter => {
+                        // Store the selected index and exit to restore terminal
+                        let (start_index, should_shuffle) = if state.selected == state.movies.len() {
+                            // Random movie selected - shuffle the queue
+                            (rand::thread_rng().gen_range(0..state.movies.len()), true)
+                        } else {
+                            // Selected movie - keep original order
+                            (state.selected, false)
+                        };
+                        
+                        *selected_index.borrow_mut() = Some(start_index);
+                        *shuffle_queue.borrow_mut() = should_shuffle;
+                        return Ok(());
+                    }
+                    _ => {}
                 }
-                KeyCode::Esc => {
-                    return Ok(());
-                }
-                _ => {}
             }
         }
     }
 }
 
-fn render(frame: &mut Frame, state: &mut AppState) {
-    // Split the frame into two areas: left for list, right for info
+fn render(frame: &mut Frame, state: &mut AppState, elapsed: Duration, timeout_seconds: u64) {
+    // Split the frame: top taskbar, then main content area
+    let main_chunks = Layout::default()
+        .direction(ratatui::layout::Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
+        .split(frame.area());
+    
+    let taskbar_area = main_chunks[0];
+    let content_area = main_chunks[1];
+    
+    // Split the content area into two: left for list, right for info
     let chunks = Layout::default()
         .direction(ratatui::layout::Direction::Horizontal)
         .constraints([Constraint::Percentage(70), Constraint::Percentage(30)].as_ref())
-        .split(frame.area());
+        .split(content_area);
     
     let list_area = chunks[0];
     let info_area = chunks[1];
+    
+    // Render the taskbar
+    // Get current time and date using chrono
+    let now = chrono::Local::now();
+    let time_str = now.format("%H:%M:%S").to_string();
+    let date_str = now.format("%Y-%m-%d").to_string();
+    
+    // Calculate remaining time until auto-play
+    let remaining = Duration::from_secs(timeout_seconds).saturating_sub(elapsed);
+    let remaining_secs = remaining.as_secs();
+    let timer_str = format!("Auto-play in: {:02}s", remaining_secs);
+    
+    // Create taskbar content
+    let taskbar_text = format!("{} | {} | {} | Enter=Play | Esc=Exit | ↑↓=Navigate", 
+        time_str, date_str, timer_str);
+    
+    let taskbar = Paragraph::new(taskbar_text)
+        .style(Style::default().fg(Color::White))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+        );
+    
+    frame.render_widget(taskbar, taskbar_area);
     
     // Build display list with group headers
     let mut items: Vec<ListItem> = Vec::new();
@@ -352,8 +424,8 @@ fn render(frame: &mut Frame, state: &mut AppState) {
         
         // Add movie item
         let name = movie.path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("Unknown");
+                .and_then(|n| n.to_str())
+                .unwrap_or("Unknown");
         let prefix = if movie_idx == state.selected { "> " } else { "  " };
         let item_text = format!("{}{}", prefix, name);
         
