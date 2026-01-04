@@ -8,6 +8,10 @@ use ratatui::{DefaultTerminal, Frame, widgets::{Block, Borders, List, ListItem, 
 use crossterm::event::{Event, KeyCode, KeyEventKind, poll};
 use rand::Rng;
 use rand::seq::SliceRandom;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static AUTO_PLAY_NEXT: AtomicBool = AtomicBool::new(true);
+
 
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "avi", "mov", "webm", "m4v"];
 
@@ -30,6 +34,14 @@ struct AppState {
     selected: usize,
     movie_info_cache: HashMap<PathBuf, MovieInfo>,
     scroll_offset: usize,
+}
+
+fn toggle_auto_play_next() {
+    AUTO_PLAY_NEXT.fetch_xor(true, Ordering::SeqCst);
+}
+
+fn check_auto_play_next() -> bool {
+    AUTO_PLAY_NEXT.load(Ordering::SeqCst)
 }
 
 fn is_video(path: &Path) -> bool {
@@ -261,6 +273,9 @@ fn play_movies_from_index(movies: &[MovieEntry], start_index: usize, shuffle_ord
         if exit_code != 0 {
             return Ok(());
         }
+        if !check_auto_play_next() {
+            return Ok(());
+        }
     }
     
     Ok(())
@@ -277,17 +292,28 @@ fn main() -> color_eyre::Result<()> {
     
     let selected_index = RefCell::new(None);
     let shuffle_queue = RefCell::new(false);
-    ratatui::run(|terminal| app(terminal, &movies, &selected_index, &shuffle_queue))?;
-    
-    // After terminal is restored, play the selected movie
-    if let Some(start_index) = selected_index.into_inner() {
-        play_movies_from_index(&movies, start_index, shuffle_queue.into_inner())?;
+    let should_exit = RefCell::new(false);
+
+    loop {
+        ratatui::run(|terminal| app(terminal, &movies, &selected_index, &shuffle_queue, &should_exit))?;
+
+        // If the UI signaled to exit (Esc pressed), break the main loop and quit
+        if *should_exit.borrow() {
+            break;
+        }
+
+        let start_index = selected_index.borrow_mut().take();
+        let shuffle = *shuffle_queue.borrow();
+
+        if let Some(start_index) = start_index {
+            play_movies_from_index(&movies, start_index, shuffle)?;
+        }
     }
     
     Ok(())
 }
 
-fn app(terminal: &mut DefaultTerminal, movies: &[MovieEntry], selected_index: &RefCell<Option<usize>>, shuffle_queue: &RefCell<bool>) -> std::io::Result<()> {
+fn app(terminal: &mut DefaultTerminal, movies: &[MovieEntry], selected_index: &RefCell<Option<usize>>, shuffle_queue: &RefCell<bool>, should_exit: &RefCell<bool>) -> std::io::Result<()> {
     let mut state = AppState {
         movies: movies.to_vec(),
         selected: 0,
@@ -321,8 +347,9 @@ fn app(terminal: &mut DefaultTerminal, movies: &[MovieEntry], selected_index: &R
                 continue;
             }
 
-                // Handle Esc immediately (exit without resetting timer)
+                // Handle Esc immediately: signal the main loop to exit
                 if key.code == KeyCode::Esc {
+                    *should_exit.borrow_mut() = true;
                     return Ok(());
                 }
                 
@@ -344,21 +371,25 @@ fn app(terminal: &mut DefaultTerminal, movies: &[MovieEntry], selected_index: &R
                         state.selected = 0; // Wrap to first movie
                     }
                 }
-                    KeyCode::Enter => {
-                        // Store the selected index and exit to restore terminal
-                        let (start_index, should_shuffle) = if state.selected == state.movies.len() {
-                            // Random movie selected - shuffle the queue
-                            (rand::thread_rng().gen_range(0..state.movies.len()), true)
-                        } else {
-                            // Selected movie - keep original order
-                            (state.selected, false)
-                        };
-                        
-                        *selected_index.borrow_mut() = Some(start_index);
-                        *shuffle_queue.borrow_mut() = should_shuffle;
-                        return Ok(());
+                KeyCode::Enter => {
+                    // Store the selected index and exit to restore terminal
+                    let (start_index, should_shuffle) = if state.selected == state.movies.len() {
+                        // Random movie selected - shuffle the queue
+                        (rand::thread_rng().gen_range(0..state.movies.len()), true)
+                    } else {
+                        // Selected movie - keep original order
+                        (state.selected, false)
+                    };
+                    
+                    *selected_index.borrow_mut() = Some(start_index);
+                    *shuffle_queue.borrow_mut() = should_shuffle;
+                    return Ok(());
                     }
-                    _ => {}
+                KeyCode::Char('n') => {
+                    toggle_auto_play_next();
+                    return Ok(());
+                }
+                _ => {}
                 }
             }
         }
@@ -396,8 +427,8 @@ fn render(frame: &mut Frame, state: &mut AppState, elapsed: Duration, timeout_se
     let timer_str = format!("Auto-play in: {:02}s", remaining_secs);
     
     // Create taskbar content
-    let taskbar_text = format!("{} | {} | {} | Enter=Play | Esc=Exit | ↑↓=Navigate", 
-        time_str, date_str, timer_str);
+    let taskbar_text = format!("{} | {} | {} | Enter=Play | Esc=Exit | ↑↓=Navigate | Autoplay Next (n)={}", 
+        time_str, date_str, timer_str, check_auto_play_next().to_string());
     
     let taskbar = Paragraph::new(taskbar_text)
         .style(Style::default().fg(Color::White))
