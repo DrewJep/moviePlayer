@@ -387,7 +387,7 @@ fn app(terminal: &mut DefaultTerminal, movies: &[MovieEntry], selected_index: &R
                     }
                 KeyCode::Char('n') => {
                     toggle_auto_play_next();
-                    return Ok(());
+                    last_input_time = Instant::now();
                 }
                 _ => {}
                 }
