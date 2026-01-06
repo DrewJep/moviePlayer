@@ -23,4 +23,6 @@ target
 # Movies
 movies/
 
+player/movies
+
 .DS_Store

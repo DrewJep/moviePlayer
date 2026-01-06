@@ -64,6 +64,12 @@ fn load_movies() -> std::io::Result<Vec<MovieEntry>> {
                 let path = entry.path();
                 
                 if path.is_file() && is_video(&path) {
+                    // Skip AppleDouble metadata files that start with "._"
+                    if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
+                        if fname.starts_with("._") {
+                            continue;
+                        }
+                    }
                     // Get the parent directory name relative to the base movies directory
                     let group_name = if let Some(parent) = path.parent() {
                         if parent == base_dir {
