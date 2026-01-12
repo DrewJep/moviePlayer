@@ -27,3 +27,13 @@ init_db.py # Initialize movies table
 db_access.py # Helper functions to query/update DB
 
 source venv/bin/activate
+
+brew services start postgresql
+brew services stop postgresql
+brew services list
+
+uvicorn api.main:app --reload
+
+psql -d movies_db
+
+TRUNCATE TABLE movies RESTART IDENTITY CASCADE;

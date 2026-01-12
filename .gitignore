@@ -30,3 +30,5 @@ player/movies
 scraper/venv
 
 db/__pycache__
+api/__pycache__
+.env

@@ -1,10 +1,17 @@
 # import beautifulsoup4
+import os
 import requests
 
+OMDB_APIKEY = os.environ.get('OMDB_APIKEY')
+
+
 def confirm_existance(title):
-    response = requests.get(f'http://www.omdbapi.com/?t={title}&apikey=f1f36f17')
-    data =  response.json()
-    return data['Title'], data['Year'], data['imdbID']
+    if not OMDB_APIKEY:
+        raise RuntimeError('OMDB_APIKEY not set in environment')
+    params = {'t': title, 'apikey': OMDB_APIKEY}
+    response = requests.get('http://www.omdbapi.com/', params=params)
+    data = response.json()
+    return data.get('Title'), data.get('Year'), data.get('imdbID')
 
 def fetch_page(url):
     response = requests.get(url)
