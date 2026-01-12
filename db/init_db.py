@@ -11,6 +11,8 @@ async def init_db():
             title TEXT NOT NULL,
             year INT,
             imdb_id TEXT UNIQUE,
+            file_key TEXT,
+            file_paths JSONB,
             genre TEXT,
             director TEXT,
             actors TEXT,

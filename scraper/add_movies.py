@@ -49,12 +49,20 @@ async def insert_movie_from_file(path: str) -> None:
     title, year = parse_filename(name)
     print(f"Processing: {name} -> title='{title}', year={year}")
 
-    data = confirm_existence(title, year)
+    # compute a stable file_key for this file (use relative path from project root)
+    try:
+        rel = os.path.relpath(path, PROJECT_ROOT)
+    except Exception:
+        rel = path
+
+    data = confirm_existence(title, None)
     if data:
         movie_data = {
             'title': data.get('Title') or title,
             'year': int(data.get('Year')) if data.get('Year') and data.get('Year').isdigit() else None,
             'imdb_id': data.get('imdbID'),
+            'file_key': rel,
+            'file_paths': [rel],
             'genre': data.get('Genre'),
             'director': data.get('Director'),
             'actors': data.get('Actors'),
@@ -71,6 +79,8 @@ async def insert_movie_from_file(path: str) -> None:
             'title': title,
             'year': None,
             'imdb_id': None,
+            'file_key': rel,
+            'file_paths': [rel],
             'genre': None,
             'director': None,
             'actors': None,

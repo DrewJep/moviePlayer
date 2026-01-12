@@ -16,13 +16,18 @@ DB_CONFIG = {
 async def insert_movie(movie: dict):
     conn = await asyncpg.connect(**DB_CONFIG)
     await conn.execute("""
-        INSERT INTO movies(title, year, imdb_id, genre, director, actors, plot, language, country, poster_url, runtime, rating, additional_info)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-        ON CONFLICT (imdb_id) DO NOTHING
-    """, movie.get("title"), movie.get("year"), movie.get("imdb_id"), movie.get("genre"),
-         movie.get("director"), movie.get("actors"), movie.get("plot"), movie.get("language"),
-         movie.get("country"), movie.get("poster_url"), movie.get("runtime"), movie.get("rating"),
-         movie.get("additional_info"))
+        INSERT INTO movies(title, year, imdb_id, file_key, file_paths, genre, director, actors, plot, language, country, poster_url, runtime, rating, additional_info)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+        ON CONFLICT (imdb_id) DO UPDATE
+        SET
+            file_paths = COALESCE(movies.file_paths, '[]'::jsonb) || COALESCE(EXCLUDED.file_paths, '[]'::jsonb),
+            file_key = COALESCE(movies.file_key, EXCLUDED.file_key)
+    """,
+    movie.get("title"), movie.get("year"), movie.get("imdb_id"), movie.get("file_key"),
+    json.dumps(movie.get("file_paths")) if movie.get("file_paths") is not None else None,
+    movie.get("genre"), movie.get("director"), movie.get("actors"), movie.get("plot"), movie.get("language"),
+    movie.get("country"), movie.get("poster_url"), movie.get("runtime"), movie.get("rating"),
+    movie.get("additional_info"))
     await conn.close()
 
 async def get_all_movies(limit=50):
