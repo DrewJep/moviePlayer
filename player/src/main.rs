@@ -15,6 +15,7 @@ use rand::seq::SliceRandom;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static AUTO_PLAY_NEXT: AtomicBool = AtomicBool::new(true);
+static SHUFFLE_QUEUE: AtomicBool = AtomicBool::new(false);
 
 
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "avi", "mov", "webm", "m4v"];
@@ -30,7 +31,7 @@ struct MovieInfo {
     runtime: Option<String>,
     rating: Option<f64>,
     watch_count: Option<i32>,
-    imdb_id: Option<String>,
+    _imdb_id: Option<String>,
 
     // Fallback file-level metadata (kept for compatibility)
     file_size: Option<String>,
@@ -57,6 +58,14 @@ fn toggle_auto_play_next() {
 
 fn check_auto_play_next() -> bool {
     AUTO_PLAY_NEXT.load(Ordering::SeqCst)
+}
+
+fn toggle_shuffle_queue() {
+    SHUFFLE_QUEUE.fetch_xor(true, Ordering::SeqCst);
+}
+
+fn check_shuffle_queue() -> bool {
+    SHUFFLE_QUEUE.load(Ordering::SeqCst)
 }
 
 fn is_video(path: &Path) -> bool {
@@ -188,7 +197,7 @@ fn load_movies() -> std::io::Result<(Vec<MovieEntry>, HashMap<PathBuf, MovieInfo
                             runtime: mv.get("runtime").and_then(|v| v.as_str().map(|s| s.to_string())),
                             rating: mv.get("rating").and_then(|v| v.as_f64()),
                             watch_count: mv.get("watch_count").and_then(|v| v.as_i64().map(|n| n as i32)),
-                            imdb_id: mv.get("imdb_id").and_then(|v| v.as_str().map(|s| s.to_string())),
+                            _imdb_id: mv.get("imdb_id").and_then(|v| v.as_str().map(|s| s.to_string())),
                             file_size: None,
                             codec: None,
                             resolution: None,
@@ -314,7 +323,7 @@ fn get_movie_info(path: &Path) -> MovieInfo {
                 file_size,
                 codec,
                 resolution,
-                imdb_id: None,
+                _imdb_id: None,
             }
         }
         _ => {
@@ -335,7 +344,7 @@ fn get_movie_info(path: &Path) -> MovieInfo {
                 file_size,
                 codec: None,
                 resolution: None,
-                imdb_id: None,
+                _imdb_id: None,
             }
         }
     }
@@ -346,12 +355,28 @@ fn play_movies_from_index(movies: &[MovieEntry], start_index: usize, shuffle_ord
         return Ok(());
     }
 
-    // If shuffle_order is true, create a shuffled copy of the movies
+    // If shuffle_order is true, preserve the selected movie as first and shuffle the rest.
     let movies_to_play: Vec<MovieEntry> = if shuffle_order {
-        let mut shuffled: Vec<MovieEntry> = movies.to_vec();
-        let mut rng = rand::thread_rng();
-        shuffled.shuffle(&mut rng);
-        shuffled
+        if start_index >= movies.len() {
+            // Fallback: shuffle everything if the start index is out of bounds
+            let mut shuffled: Vec<MovieEntry> = movies.to_vec();
+            let mut rng = rand::thread_rng();
+            shuffled.shuffle(&mut rng);
+            shuffled
+        } else {
+            let mut rng = rand::thread_rng();
+            // Collect indices of all movies except the selected one
+            let mut other_idxs: Vec<usize> = (0..movies.len()).filter(|&i| i != start_index).collect();
+            other_idxs.shuffle(&mut rng);
+
+            // Start with the selected movie, then append the shuffled others
+            let mut ordered: Vec<MovieEntry> = Vec::with_capacity(movies.len());
+            ordered.push(movies[start_index].clone());
+            for i in other_idxs {
+                ordered.push(movies[i].clone());
+            }
+            ordered
+        }
     } else {
         // For normal playback, keep original order but rotate to start_index
         let mut rotated = movies[start_index..].to_vec();
@@ -373,7 +398,7 @@ fn play_movies_from_index(movies: &[MovieEntry], start_index: usize, shuffle_ord
             .unwrap_or_else(|_| movie.path.to_string_lossy().to_string());
         let candidates = vec![format!("movies/{}", rel), rel.clone(), format!("./movies/{}", rel)];
         // Try incrementing by imdb_id from cached info if present
-        if let Ok(client_api) = std::env::var("API_URL") {
+        if std::env::var("API_URL").is_ok() {
             // prefer imdb_id if the movie_info cache has it
             // (we don't have access to the cache here; attempt by path)
             let endpoint = format!("{}/movies/increment_watch/", api_base.trim_end_matches('/'));
@@ -417,12 +442,12 @@ fn main() -> color_eyre::Result<()> {
     }
     
     let selected_index = RefCell::new(None);
-    let shuffle_queue = RefCell::new(false);
+    let shuffle_queue = &SHUFFLE_QUEUE;
     let should_exit = RefCell::new(false);
 
     loop {
         let info_map_ref = &movie_info_cache;
-        ratatui::run(|terminal| app(terminal, &movies, info_map_ref, &selected_index, &shuffle_queue, &should_exit))?;
+        ratatui::run(|terminal| app(terminal, &movies, info_map_ref, &selected_index, shuffle_queue, &should_exit))?;
 
         // If the UI signaled to exit (Esc pressed), break the main loop and quit
         if *should_exit.borrow() {
@@ -430,7 +455,7 @@ fn main() -> color_eyre::Result<()> {
         }
 
         let start_index = selected_index.borrow_mut().take();
-        let shuffle = *shuffle_queue.borrow();
+        let shuffle = shuffle_queue.load(Ordering::SeqCst);
 
         if let Some(start_index) = start_index {
             play_movies_from_index(&movies, start_index, shuffle)?;
@@ -440,7 +465,7 @@ fn main() -> color_eyre::Result<()> {
     Ok(())
 }
 
-fn app(terminal: &mut DefaultTerminal, movies: &[MovieEntry], movie_info_map: &HashMap<PathBuf, MovieInfo>, selected_index: &RefCell<Option<usize>>, shuffle_queue: &RefCell<bool>, should_exit: &RefCell<bool>) -> std::io::Result<()> {
+fn app(terminal: &mut DefaultTerminal, movies: &[MovieEntry], movie_info_map: &HashMap<PathBuf, MovieInfo>, selected_index: &RefCell<Option<usize>>, shuffle_queue: &AtomicBool, should_exit: &RefCell<bool>) -> std::io::Result<()> {
     let mut state = AppState {
         movies: movies.to_vec(),
         selected: 0,
@@ -460,7 +485,7 @@ fn app(terminal: &mut DefaultTerminal, movies: &[MovieEntry], movie_info_map: &H
             // Auto-select random movie and shuffle queue
             let random_index = rand::thread_rng().gen_range(0..state.movies.len());
             *selected_index.borrow_mut() = Some(random_index);
-            *shuffle_queue.borrow_mut() = true;
+            shuffle_queue.store(true, Ordering::SeqCst);
             return Ok(());
         }
         
@@ -503,17 +528,24 @@ fn app(terminal: &mut DefaultTerminal, movies: &[MovieEntry], movie_info_map: &H
                     let (start_index, should_shuffle) = if state.selected == state.movies.len() {
                         // Random movie selected - shuffle the queue
                         (rand::thread_rng().gen_range(0..state.movies.len()), true)
+                    } else if SHUFFLE_QUEUE.load(Ordering::SeqCst) {
+                        // Selected movie - shuffle order
+                        (state.selected, true)
                     } else {
                         // Selected movie - keep original order
                         (state.selected, false)
                     };
                     
                     *selected_index.borrow_mut() = Some(start_index);
-                    *shuffle_queue.borrow_mut() = should_shuffle;
+                    shuffle_queue.store(should_shuffle, Ordering::SeqCst);
                     return Ok(());
-                    }
+                }
                 KeyCode::Char('n') => {
                     toggle_auto_play_next();
+                    last_input_time = Instant::now();
+                }
+                KeyCode::Char('s') => {
+                    toggle_shuffle_queue();
                     last_input_time = Instant::now();
                 }
                 _ => {}
@@ -554,8 +586,8 @@ fn render(frame: &mut Frame, state: &mut AppState, elapsed: Duration, timeout_se
     let timer_str = format!("Auto-play in: {:02}s", remaining_secs);
     
     // Create taskbar content
-    let taskbar_text = format!("{} | {} | {} | Enter=Play | Esc=Exit | ↑↓=Navigate | Autoplay Next (n)={}", 
-        time_str, date_str, timer_str, check_auto_play_next().to_string());
+    let taskbar_text = format!("{} | {} | {} | Enter=Play | Esc=Exit | ↑↓=Navigate | Autoplay Next (n)={} | Shuffle (s)={}", 
+        time_str, date_str, timer_str, check_auto_play_next().to_string(), check_shuffle_queue().to_string());
     
     let taskbar = Paragraph::new(taskbar_text)
         .style(Style::default().fg(Color::White))
