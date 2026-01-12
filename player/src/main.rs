@@ -269,6 +269,10 @@ fn play_movies_from_index(movies: &[MovieEntry], start_index: usize, shuffle_ord
             .args([
                 "--fullscreen",
                 "--no-terminal",
+                "--no-sub",
+                // "--sub-auto=no",
+                // "--sid=-1",
+
                 movie.path.to_str().unwrap(),
             ])
             .status()
