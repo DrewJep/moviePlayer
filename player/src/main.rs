@@ -52,7 +52,7 @@ fn is_video(path: &Path) -> bool {
 }
 
 fn load_movies() -> std::io::Result<Vec<MovieEntry>> {
-    let movies_dir = Path::new("movies");
+    let movies_dir = Path::new("../movies");
 
     // Recursively collect all video files
     let mut movies: Vec<MovieEntry> = Vec::new();
@@ -272,7 +272,6 @@ fn play_movies_from_index(movies: &[MovieEntry], start_index: usize, shuffle_ord
                 "--no-sub",
                 // "--sub-auto=no",
                 // "--sid=-1",
-
                 movie.path.to_str().unwrap(),
             ])
             .status()
