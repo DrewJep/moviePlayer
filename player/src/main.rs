@@ -3,6 +3,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::env;
+
+use reqwest::blocking::Client as HttpClient;
+use serde_json::Value as JsonValue;
 use std::time::{Instant, Duration};
 use ratatui::{DefaultTerminal, Frame, widgets::{Block, Borders, List, ListItem, Paragraph}, layout::{Layout, Constraint}, style::{Style, Color, Modifier}, text::{Line, Span}};
 use crossterm::event::{Event, KeyCode, KeyEventKind, poll};
@@ -15,9 +19,19 @@ static AUTO_PLAY_NEXT: AtomicBool = AtomicBool::new(true);
 
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "avi", "mov", "webm", "m4v"];
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct MovieInfo {
+    // Fields pulled from the movies DB
+    title: Option<String>,
+    year: Option<i32>,
+    genre: Option<String>,
+    director: Option<String>,
+    plot: Option<String>,
     runtime: Option<String>,
+    rating: Option<f64>,
+    watch_count: Option<i32>,
+
+    // Fallback file-level metadata (kept for compatibility)
     file_size: Option<String>,
     codec: Option<String>,
     resolution: Option<String>,
@@ -51,7 +65,7 @@ fn is_video(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn load_movies() -> std::io::Result<Vec<MovieEntry>> {
+fn load_movies() -> std::io::Result<(Vec<MovieEntry>, HashMap<PathBuf, MovieInfo>)> {
     let movies_dir = Path::new("../movies");
 
     // Recursively collect all video files
@@ -126,7 +140,73 @@ fn load_movies() -> std::io::Result<Vec<MovieEntry>> {
         result.extend(group_movies);
     }
     
-    Ok(result)
+    // Try to fetch all movies from the FastAPI `/movies/` endpoint and map file keys/paths to metadata.
+    let mut info_map: HashMap<PathBuf, MovieInfo> = HashMap::new();
+    let api_base = env::var("API_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".to_string());
+    let client = HttpClient::new();
+    let movies_url = format!("{}/movies/?limit=1000", api_base.trim_end_matches('/'));
+
+    match client.get(&movies_url).send() {
+        Ok(resp) => match resp.json::<Vec<JsonValue>>() {
+            Ok(api_movies) => {
+                // Build a map: file_path_or_key -> movie JSON value
+                let mut by_path: HashMap<String, &JsonValue> = HashMap::new();
+                for mv in &api_movies {
+                    if let Some(fk) = mv.get("file_key").and_then(|v| v.as_str()) {
+                        by_path.insert(fk.to_string(), mv);
+                    }
+                    if let Some(paths) = mv.get("file_paths").and_then(|v| v.as_array()) {
+                        for p in paths {
+                            if let Some(pstr) = p.as_str() {
+                                by_path.insert(pstr.to_string(), mv);
+                            }
+                        }
+                    }
+                }
+
+                // For each local file, attempt to find matching metadata
+                for movie in &result {
+                    let rel = movie.path.strip_prefix(movies_dir)
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| movie.path.to_string_lossy().to_string());
+                    let candidates = vec![format!("movies/{}", rel), rel.clone(), format!("./movies/{}", rel)];
+                    let mut found: Option<&JsonValue> = None;
+                    for c in &candidates {
+                        if let Some(mv) = by_path.get(c) {
+                            found = Some(*mv);
+                            break;
+                        }
+                    }
+                    if let Some(mv) = found {
+                        let info = MovieInfo {
+                            title: mv.get("title").and_then(|v| v.as_str().map(|s| s.to_string())),
+                            year: mv.get("year").and_then(|v| v.as_i64().map(|n| n as i32)),
+                            genre: mv.get("genre").and_then(|v| v.as_str().map(|s| s.to_string())),
+                            director: mv.get("director").and_then(|v| v.as_str().map(|s| s.to_string())),
+                            plot: mv.get("plot").and_then(|v| v.as_str().map(|s| s.to_string())),
+                            runtime: mv.get("runtime").and_then(|v| v.as_str().map(|s| s.to_string())),
+                            rating: mv.get("rating").and_then(|v| v.as_f64()),
+                            watch_count: mv.get("watch_count").and_then(|v| v.as_i64().map(|n| n as i32)),
+                            file_size: None,
+                            codec: None,
+                            resolution: None,
+                        };
+                        info_map.insert(movie.path.clone(), info);
+                    } else {
+                        eprintln!("API: no metadata for file; tried keys: {}", candidates.join(" | "));
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to parse /movies/ JSON: {}", e);
+            }
+        },
+        Err(e) => {
+            eprintln!("Failed to call API {}: {}", movies_url, e);
+        }
+    }
+
+    Ok((result, info_map))
 }
 
 fn format_duration(seconds: f64) -> String {
@@ -221,7 +301,14 @@ fn get_movie_info(path: &Path) -> MovieInfo {
             }
             
             MovieInfo {
+                title: None,
+                year: None,
+                genre: None,
+                director: None,
+                plot: None,
                 runtime,
+                rating: None,
+                watch_count: None,
                 file_size,
                 codec,
                 resolution,
@@ -234,7 +321,14 @@ fn get_movie_info(path: &Path) -> MovieInfo {
                 .map(|m| format_file_size(m.len()));
             
             MovieInfo {
+                title: None,
+                year: None,
+                genre: None,
+                director: None,
+                plot: None,
                 runtime: None,
+                rating: None,
+                watch_count: None,
                 file_size,
                 codec: None,
                 resolution: None,
@@ -293,7 +387,7 @@ fn play_movies_from_index(movies: &[MovieEntry], start_index: usize, shuffle_ord
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
     
-    let movies = load_movies()?;
+    let (movies, movie_info_cache) = load_movies()?;
     if movies.is_empty() {
         eprintln!("No movies found in movies/");
         return Ok(());
@@ -304,7 +398,8 @@ fn main() -> color_eyre::Result<()> {
     let should_exit = RefCell::new(false);
 
     loop {
-        ratatui::run(|terminal| app(terminal, &movies, &selected_index, &shuffle_queue, &should_exit))?;
+        let info_map_ref = &movie_info_cache;
+        ratatui::run(|terminal| app(terminal, &movies, info_map_ref, &selected_index, &shuffle_queue, &should_exit))?;
 
         // If the UI signaled to exit (Esc pressed), break the main loop and quit
         if *should_exit.borrow() {
@@ -322,11 +417,11 @@ fn main() -> color_eyre::Result<()> {
     Ok(())
 }
 
-fn app(terminal: &mut DefaultTerminal, movies: &[MovieEntry], selected_index: &RefCell<Option<usize>>, shuffle_queue: &RefCell<bool>, should_exit: &RefCell<bool>) -> std::io::Result<()> {
+fn app(terminal: &mut DefaultTerminal, movies: &[MovieEntry], movie_info_map: &HashMap<PathBuf, MovieInfo>, selected_index: &RefCell<Option<usize>>, shuffle_queue: &RefCell<bool>, should_exit: &RefCell<bool>) -> std::io::Result<()> {
     let mut state = AppState {
         movies: movies.to_vec(),
         selected: 0,
-        movie_info_cache: HashMap::new(),
+        movie_info_cache: movie_info_map.clone(),
         scroll_offset: 0,
     };
 
@@ -551,55 +646,95 @@ fn render(frame: &mut Frame, state: &mut AppState, elapsed: Duration, timeout_se
     let info_lines: Vec<Line> = if state.selected < state.movies.len() {
         let movie = &state.movies[state.selected];
         
-        // Get or cache movie info
-        let movie_info = state.movie_info_cache.entry(movie.path.clone())
-            .or_insert_with(|| get_movie_info(&movie.path));
-        
-        let movie_name = movie.path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("Unknown");
-        
-        let mut lines = vec![
-            Line::from(vec![
-                Span::styled("File: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::styled(movie_name, Style::default().fg(Color::White)),
-            ]),
-            Line::from(""),
-        ];
-        
-        if let Some(ref runtime) = movie_info.runtime {
+        // Get or cache movie info (DB-backed). If not present, fallback to file probe
+        let movie_info = state.movie_info_cache.entry(movie.path.clone()).or_insert_with(|| get_movie_info(&movie.path));
+
+        // Prefer DB title if present; otherwise show filename
+        let title = movie_info.title.clone().or_else(|| movie.path.file_stem().and_then(|s| s.to_str().map(|s| s.to_string()))).unwrap_or_else(|| "Unknown".to_string());
+
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(vec![
+            Span::styled("Title: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(title, Style::default().fg(Color::White)),
+        ]));
+
+        // Year
+        if let Some(y) = movie_info.year {
             lines.push(Line::from(vec![
-                Span::styled("Runtime: ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                Span::styled(runtime, Style::default().fg(Color::White)),
-            ]));
-        } else {
-            lines.push(Line::from(vec![
-                Span::styled("Runtime: ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                Span::styled("Unknown", Style::default().fg(Color::DarkGray)),
+                Span::styled("Year: ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::styled(y.to_string(), Style::default().fg(Color::White)),
             ]));
         }
-        
-        if let Some(ref file_size) = movie_info.file_size {
+
+        // Genre
+        if let Some(ref g) = movie_info.genre {
+            lines.push(Line::from(vec![
+                Span::styled("Genre: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(g.clone(), Style::default().fg(Color::White)),
+            ]));
+        }
+
+        // Director
+        if let Some(ref d) = movie_info.director {
+            lines.push(Line::from(vec![
+                Span::styled("Director: ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                Span::styled(d.clone(), Style::default().fg(Color::White)),
+            ]));
+        }
+
+        // Runtime (DB runtime preferred, else file probe runtime)
+        if let Some(ref rtime) = movie_info.runtime {
+            lines.push(Line::from(vec![
+                Span::styled("Runtime: ", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                Span::styled(rtime.clone(), Style::default().fg(Color::White)),
+            ]));
+        }
+
+        // Rating
+        if let Some(r) = movie_info.rating {
+            lines.push(Line::from(vec![
+                Span::styled("Rating: ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{:.1}", r), Style::default().fg(Color::White)),
+            ]));
+        }
+
+        // Watch count
+        if let Some(wc) = movie_info.watch_count {
+            lines.push(Line::from(vec![
+                Span::styled("Watch Count: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(wc.to_string(), Style::default().fg(Color::White)),
+            ]));
+        }
+
+        // Plot (wrap as single paragraph line)
+        if let Some(ref ptxt) = movie_info.plot {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("Plot: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(ptxt.clone(), Style::default().fg(Color::White)),
+            ]));
+        }
+
+        // File-level metadata fallbacks: file size, codec, resolution
+        if let Some(ref fsz) = movie_info.file_size {
             lines.push(Line::from(vec![
                 Span::styled("File Size: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                Span::styled(file_size, Style::default().fg(Color::White)),
+                Span::styled(fsz.clone(), Style::default().fg(Color::White)),
             ]));
         }
-        
-        if let Some(ref codec) = movie_info.codec {
+        if let Some(ref c) = movie_info.codec {
             lines.push(Line::from(vec![
                 Span::styled("Codec: ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-                Span::styled(codec, Style::default().fg(Color::White)),
+                Span::styled(c.clone(), Style::default().fg(Color::White)),
             ]));
         }
-        
-        if let Some(ref resolution) = movie_info.resolution {
+        if let Some(ref res) = movie_info.resolution {
             lines.push(Line::from(vec![
                 Span::styled("Resolution: ", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
-                Span::styled(resolution, Style::default().fg(Color::White)),
+                Span::styled(res.clone(), Style::default().fg(Color::White)),
             ]));
         }
-        
+
         lines
     } else {
         vec![Line::from(vec![
