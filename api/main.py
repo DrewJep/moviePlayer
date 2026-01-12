@@ -205,3 +205,24 @@ async def import_local_movies(path: Optional[str] = Query(None, description="Pat
         raise HTTPException(status_code=500, detail=f"Failed to import local movies: {e}")
 
     return {"status": "done", "scanned_path": path}
+
+
+@app.post("/movies/{imdb_id}/watch")
+async def increment_watch_imdb(imdb_id: str):
+    """Increment watch_count for a movie identified by imdb_id."""
+    updated = await db_access.increment_watch_by_imdb(imdb_id)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Movie not found")
+    return {"status": "ok", "watch_count": updated.get("watch_count")}
+
+
+@app.post("/movies/increment_watch/")
+async def increment_watch_by_path(path: str = Query(..., description="file_key or file path variant")):
+    """Increment watch_count for a movie by a file path or file_key.
+
+    This endpoint will match `file_key` or any entry inside `file_paths` JSONB.
+    """
+    updated = await db_access.increment_watch_by_path(path)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Movie not found for provided path")
+    return {"status": "ok", "watch_count": updated.get("watch_count")}

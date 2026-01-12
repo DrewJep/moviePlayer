@@ -8,7 +8,7 @@ use std::env;
 use reqwest::blocking::Client as HttpClient;
 use serde_json::Value as JsonValue;
 use std::time::{Instant, Duration};
-use ratatui::{DefaultTerminal, Frame, widgets::{Block, Borders, List, ListItem, Paragraph}, layout::{Layout, Constraint}, style::{Style, Color, Modifier}, text::{Line, Span}};
+use ratatui::{DefaultTerminal, Frame, widgets::{Block, Borders, List, ListItem, Paragraph, Wrap}, layout::{Layout, Constraint}, style::{Style, Color, Modifier}, text::{Line, Span}};
 use crossterm::event::{Event, KeyCode, KeyEventKind, poll};
 use rand::Rng;
 use rand::seq::SliceRandom;
@@ -30,6 +30,7 @@ struct MovieInfo {
     runtime: Option<String>,
     rating: Option<f64>,
     watch_count: Option<i32>,
+    imdb_id: Option<String>,
 
     // Fallback file-level metadata (kept for compatibility)
     file_size: Option<String>,
@@ -187,6 +188,7 @@ fn load_movies() -> std::io::Result<(Vec<MovieEntry>, HashMap<PathBuf, MovieInfo
                             runtime: mv.get("runtime").and_then(|v| v.as_str().map(|s| s.to_string())),
                             rating: mv.get("rating").and_then(|v| v.as_f64()),
                             watch_count: mv.get("watch_count").and_then(|v| v.as_i64().map(|n| n as i32)),
+                            imdb_id: mv.get("imdb_id").and_then(|v| v.as_str().map(|s| s.to_string())),
                             file_size: None,
                             codec: None,
                             resolution: None,
@@ -312,6 +314,7 @@ fn get_movie_info(path: &Path) -> MovieInfo {
                 file_size,
                 codec,
                 resolution,
+                imdb_id: None,
             }
         }
         _ => {
@@ -332,6 +335,7 @@ fn get_movie_info(path: &Path) -> MovieInfo {
                 file_size,
                 codec: None,
                 resolution: None,
+                imdb_id: None,
             }
         }
     }
@@ -358,6 +362,25 @@ fn play_movies_from_index(movies: &[MovieEntry], start_index: usize, shuffle_ord
     // Play movies in order (either shuffled or rotated)
     for movie in movies_to_play {
         println!("Playing {}", movie.path.display());
+
+        // Increment watch count via API if available
+        let api_base = env::var("API_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".to_string());
+        let http = HttpClient::new();
+        // compute relative key variants similar to load_movies
+        let movies_dir = Path::new("../movies");
+        let rel = movie.path.strip_prefix(movies_dir)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| movie.path.to_string_lossy().to_string());
+        let candidates = vec![format!("movies/{}", rel), rel.clone(), format!("./movies/{}", rel)];
+        // Try incrementing by imdb_id from cached info if present
+        if let Ok(client_api) = std::env::var("API_URL") {
+            // prefer imdb_id if the movie_info cache has it
+            // (we don't have access to the cache here; attempt by path)
+            let endpoint = format!("{}/movies/increment_watch/", api_base.trim_end_matches('/'));
+            for c in &candidates {
+                let _ = http.post(&endpoint).query(&[("path", c)]).send();
+            }
+        }
 
         let status = Command::new("mpv")
             .args([
@@ -743,6 +766,7 @@ fn render(frame: &mut Frame, state: &mut AppState, elapsed: Duration, timeout_se
     };
     
     let info_paragraph = Paragraph::new(info_lines)
+        .wrap(Wrap { trim: true })
         .block(
             Block::default()
                 .borders(Borders::ALL)

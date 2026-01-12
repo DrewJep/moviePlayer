@@ -47,3 +47,22 @@ async def get_movie_by_imdb(imdb_id: str):
     row = await conn.fetchrow("SELECT * FROM movies WHERE imdb_id=$1", imdb_id)
     await conn.close()
     return dict(row) if row else None
+
+
+async def increment_watch_by_imdb(imdb_id: str):
+    conn = await asyncpg.connect(**DB_CONFIG)
+    row = await conn.fetchrow("UPDATE movies SET watch_count = COALESCE(watch_count, 0) + 1 WHERE imdb_id=$1 RETURNING watch_count", imdb_id)
+    await conn.close()
+    return dict(row) if row else None
+
+
+async def increment_watch_by_path(path: str):
+    # Attempt to match either file_key or any file_paths containing the given path
+    conn = await asyncpg.connect(**DB_CONFIG)
+    jsonb = json.dumps([path])
+    row = await conn.fetchrow(
+        "UPDATE movies SET watch_count = COALESCE(watch_count, 0) + 1 WHERE file_key=$1 OR file_paths @> $2::jsonb RETURNING watch_count",
+        path, jsonb
+    )
+    await conn.close()
+    return dict(row) if row else None
