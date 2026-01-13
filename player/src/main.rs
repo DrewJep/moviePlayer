@@ -8,7 +8,11 @@ use std::env;
 use reqwest::blocking::Client as HttpClient;
 use serde_json::Value as JsonValue;
 use std::time::{Instant, Duration};
-use ratatui::{DefaultTerminal, Frame, widgets::{Block, Borders, List, ListItem, Paragraph, Wrap}, layout::{Layout, Constraint}, style::{Style, Color, Modifier}, text::{Line, Span}};
+use ratatui::{DefaultTerminal, Frame, 
+            widgets::{Block, Borders, List, ListItem, Paragraph, Wrap, Clear}, 
+            layout::{Layout, Constraint, Flex, Rect, Position}, 
+            style::{Style, Color, Modifier}, 
+            text::{Line, Span}};
 use crossterm::event::{Event, KeyCode, KeyEventKind, poll};
 use rand::Rng;
 use rand::seq::SliceRandom;
@@ -45,11 +49,22 @@ struct MovieEntry {
     group_name: String,
 }
 
+enum InputMode {
+    Normal,
+    #[allow(dead_code)]
+    Editing,
+}
+
 struct AppState {
     movies: Vec<MovieEntry>,
     selected: usize,
     movie_info_cache: HashMap<PathBuf, MovieInfo>,
     scroll_offset: usize,
+    show_popup: bool,
+    user_input: String,
+    #[allow(dead_code)]
+    input_mode: InputMode,
+    character_index: usize,
 }
 
 fn toggle_auto_play_next() {
@@ -432,6 +447,62 @@ fn play_movies_from_index(movies: &[MovieEntry], start_index: usize, shuffle_ord
     Ok(())
 }
 
+/// helper function to create a centered rect using up certain percentage of the available rect `r`
+/// Gotten from ratatui examples
+fn popup_area(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
+    let vertical = Layout::vertical([Constraint::Percentage(percent_y)]).flex(Flex::Center);
+    let horizontal = Layout::horizontal([Constraint::Percentage(percent_x)]).flex(Flex::Center);
+    let [area] = vertical.areas(area);
+    let [area] = horizontal.areas(area);
+    area
+}
+
+impl AppState {
+    fn move_cursor_left(&mut self) {
+        let cursor_moved_left = self.character_index.saturating_sub(1);
+        self.character_index = self.clamp_cursor(cursor_moved_left);
+    }
+
+    fn move_cursor_right(&mut self) {
+        let cursor_moved_right = self.character_index.saturating_add(1);
+        self.character_index = self.clamp_cursor(cursor_moved_right);
+    }
+
+    fn enter_char(&mut self, new_char: char) {
+        self.user_input.insert(self.character_index, new_char);
+        self.move_cursor_right();
+    }
+
+    fn delete_char(&mut self) {
+        let is_not_cursor_leftmost = self.character_index != 0;
+        if is_not_cursor_leftmost {
+            let current_index = self.character_index;
+            let from_left_to_current_index = current_index - 1;
+
+            let before_char_to_delete = self.user_input.chars().take(from_left_to_current_index);
+            let after_char_to_delete = self.user_input.chars().skip(current_index);
+
+            self.user_input = before_char_to_delete.chain(after_char_to_delete).collect();
+            self.move_cursor_left();
+        }
+    }
+
+    fn clamp_cursor(&self, new_cursor_pos: usize) -> usize {
+        new_cursor_pos.clamp(0, self.user_input.chars().count())
+    }
+
+    fn reset_cursor(&mut self) {
+        self.character_index = 0;
+    }
+
+    fn clear_input(&mut self) {
+        self.user_input.clear();
+        self.reset_cursor();
+    }
+}
+
+
+
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
     
@@ -471,6 +542,10 @@ fn app(terminal: &mut DefaultTerminal, movies: &[MovieEntry], movie_info_map: &H
         selected: 0,
         movie_info_cache: movie_info_map.clone(),
         scroll_offset: 0,
+        show_popup: false,
+        user_input: String::new(),
+        input_mode: InputMode::Normal,
+        character_index: 0,
     };
 
     let mut last_input_time = Instant::now();
@@ -499,56 +574,87 @@ fn app(terminal: &mut DefaultTerminal, movies: &[MovieEntry], movie_info_map: &H
                 continue;
             }
 
-                // Handle Esc immediately: signal the main loop to exit
-                if key.code == KeyCode::Esc {
-                    *should_exit.borrow_mut() = true;
-                    return Ok(());
-                }
-                
-                // Reset the timer on any other user input
+                // Reset the timer on any user input
                 last_input_time = Instant::now();
 
-            match key.code {
-                KeyCode::Up => {
-                    if state.selected > 0 {
-                        state.selected -= 1;
-                    } else {
-                        state.selected = state.movies.len(); // Wrap to "Random Movie"
+                // Handle text input when popup is open
+                if state.show_popup {
+                    match key.code {
+                        KeyCode::Esc => {
+                            // Close the popup without exiting the app
+                            state.show_popup = false;
+                            state.clear_input();
+                        }
+                        KeyCode::Char(c) => {
+                            state.enter_char(c);
+                        }
+                        KeyCode::Backspace => {
+                            state.delete_char();
+                        }
+                        KeyCode::Left => {
+                            state.move_cursor_left();
+                        }
+                        KeyCode::Right => {
+                            state.move_cursor_right();
+                        }
+                        KeyCode::Home => {
+                            state.reset_cursor();
+                        }
+                        KeyCode::End => {
+                            state.character_index = state.user_input.chars().count();
+                        }
+                        _ => {}
                     }
-                }
-                KeyCode::Down => {
-                    if state.selected < state.movies.len() {
-                        state.selected += 1;
-                    } else {
-                        state.selected = 0; // Wrap to first movie
+                } else {
+                    // Handle normal navigation when popup is closed
+                    match key.code {
+                        KeyCode::Esc => {
+                            // Exit the app when popup is not open
+                            *should_exit.borrow_mut() = true;
+                            return Ok(());
+                        }
+                        KeyCode::Up => {
+                            if state.selected > 0 {
+                                state.selected -= 1;
+                            } else {
+                                state.selected = state.movies.len(); // Wrap to "Random Movie"
+                            }
+                        }
+                        KeyCode::Down => {
+                            if state.selected < state.movies.len() {
+                                state.selected += 1;
+                            } else {
+                                state.selected = 0; // Wrap to first movie
+                            }
+                        }
+                        KeyCode::Enter => {
+                            // Store the selected index and exit to restore terminal
+                            let (start_index, should_shuffle) = if state.selected == state.movies.len() {
+                                // Random movie selected - shuffle the queue
+                                (rand::thread_rng().gen_range(0..state.movies.len()), true)
+                            } else if SHUFFLE_QUEUE.load(Ordering::SeqCst) {
+                                // Selected movie - shuffle order
+                                (state.selected, true)
+                            } else {
+                                // Selected movie - keep original order
+                                (state.selected, false)
+                            };
+                            
+                            *selected_index.borrow_mut() = Some(start_index);
+                            shuffle_queue.store(should_shuffle, Ordering::SeqCst);
+                            return Ok(());
+                        }
+                        KeyCode::Char('n') => {
+                            toggle_auto_play_next();
+                        }
+                        KeyCode::Char('s') => {
+                            toggle_shuffle_queue();
+                        }
+                        KeyCode::Char(' ') => {
+                            state.show_popup = !state.show_popup;
+                        }
+                        _ => {}
                     }
-                }
-                KeyCode::Enter => {
-                    // Store the selected index and exit to restore terminal
-                    let (start_index, should_shuffle) = if state.selected == state.movies.len() {
-                        // Random movie selected - shuffle the queue
-                        (rand::thread_rng().gen_range(0..state.movies.len()), true)
-                    } else if SHUFFLE_QUEUE.load(Ordering::SeqCst) {
-                        // Selected movie - shuffle order
-                        (state.selected, true)
-                    } else {
-                        // Selected movie - keep original order
-                        (state.selected, false)
-                    };
-                    
-                    *selected_index.borrow_mut() = Some(start_index);
-                    shuffle_queue.store(should_shuffle, Ordering::SeqCst);
-                    return Ok(());
-                }
-                KeyCode::Char('n') => {
-                    toggle_auto_play_next();
-                    last_input_time = Instant::now();
-                }
-                KeyCode::Char('s') => {
-                    toggle_shuffle_queue();
-                    last_input_time = Instant::now();
-                }
-                _ => {}
                 }
             }
         }
@@ -808,4 +914,31 @@ fn render(frame: &mut Frame, state: &mut AppState, elapsed: Duration, timeout_se
         );
     
     frame.render_widget(info_paragraph, info_area);
+
+    // Render Search Bar Popup
+    if state.show_popup {
+        let area = popup_area(frame.area(), 20, 10);
+        frame.render_widget(Clear, area); // Clear the background
+        
+        // Create the input display with cursor
+        let input_display = format!("{}_", state.user_input);
+        let cursor_position = state.character_index;
+        
+        let input_paragraph = Paragraph::new(input_display)
+            .style(Style::default().fg(Color::White))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Green))
+                    .title("Search | Press ESC to exit")
+            );
+        
+        frame.render_widget(input_paragraph, area);
+        
+        // Set the cursor position for the terminal
+        frame.set_cursor_position(Position {
+            x: area.x + cursor_position as u16 + 1,
+            y: area.y + 1,
+        });
+    }
 }

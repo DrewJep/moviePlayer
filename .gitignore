@@ -27,7 +27,8 @@ player/movies
 
 .DS_Store
 
-scraper/venv
+
+venv
 
 db/__pycache__
 api/__pycache__
